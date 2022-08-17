@@ -15,6 +15,40 @@ library(dplyr)
 library(ggplot2)
 ```
 
+Current approach in the estimate of transcription rate (TR) shifts buffering suffers from the interdependence of TR and half-life (HL) measurement. Indeed, the denominator in a ratio method is TR itself.
+
+Denote measured TR and steady-state (SS) log2 fold-change as logT and logS. Similarly denote real TR and steady-state (SS) log2 fold-change as logT_r and logS_r. Finally, let N_t and N_s be noise components for the TR and SS respectivelty. Then:
+
+logT = logT_r + N_t
+logS = logS_r + N_s
+
+Estimated HL log2 fold-change logHL is:
+logHL = logS - logT = (logS_r - logT_r) + (N_s - N_t) = logHL_r + (N_s - N_t)
+
+Then, in a heatmap and boxplot we look at a comparison between logT and logHL. There are two main regimes.
+
+A) Noise is bigger than a real signal (N_s - N_t >> logHL_r & N_t >> logT_r). Then we basically compare:
+N_t vs (N_s - N_t)
+In this case, a noise induced negative relation between TR and HL changes will be observed.
+
+B) Signal is bigger than noise (logT_r and logHL_r dominates).
+Then, we observe true signal logT_r vs logHL_r
+
+We used subsetting of 10 replicates from the same genotype mouse data into samples with 2,3,etc replicates to estimate the noise pattern in logT vs logHL for the "A" regime. Procedure:
+1. Pick N replicates from the 10 replicates of WT samples. Denote them as Wildtype
+2. Pick N replicates from the 10 replicates of WT samples. Denote them as Mutant
+3. Estimate logT and logS
+4. Plot logS - logT vs logT
+
+For small N (large noise), the logS - logT vs logT is close the line with -1 slope
+For large N (small noise, no signal), the logS - logT vs logT is flat
+
+In contrast the mouse data has a saturation at large values of logT in both directions. Suggesting the presence of a signal in the data.
+
+In addition our data had same buffering pattern with a HL measured by a saturation curve method (including all time points). However, the saturation curve has a slight link to the TR measurement through early time points.
+
+A clean description of buffering would combine "pulse and chase" approach of HL measurement (when decay of labeled mRNAs is observed) with our current approach of TR measerement.
+
 Upload transcription rate, steady state and half-life data
 ```{r}
 TR_tbl = read.csv("./TR_log2FC_deseq2.csv.gz",
