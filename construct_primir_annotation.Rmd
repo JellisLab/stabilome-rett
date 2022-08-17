@@ -1,0 +1,190 @@
+---
+title: "Identify intergenic primary miRNA transcripts"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Load library
+```{r}
+library(dplyr)
+```
+
+Create primary miRNA transcripts annotation for hg38.
+Annotation of pri-miRNAs (human.gtf) is downloaded from: PMID: 26290535
+```{r}
+chain <- rtracklayer::import.chain("./hg19ToHg38.over.chain")
+primirs_hg19 = rtracklayer::import("./human.gtf")
+GenomeInfoDb::seqlevelsStyle(primirs_hg19) = "UCSC"
+primirs_all = rtracklayer::liftOver(x = primirs_hg19, chain = chain)
+primirs_all = unlist(primirs_all)
+annot_primirs_df = as.data.frame(primirs_all) %>%
+                           group_by(seqnames, gene_id, strand) %>%
+                           summarise(start = min(start),
+                                     end = max(end)) %>%
+                           mutate(width = end - start) %>%
+                           ungroup() %>%
+                           mutate(queryHits = 1:n())
+annot_primirs = GenomicRanges::GRanges(seqnames = annot_primirs_df$seqnames, 
+                                       ranges = IRanges::IRanges(start = annot_primirs_df$start,
+                                                                 end = annot_primirs_df$end), 
+                                       strand = annot_primirs_df$strand,
+                                       gene_id = annot_primirs_df$gene_id)
+
+```
+
+Define pA sites of pri-miRNAs
+```{r}
+upstream_width = 40
+downstream_width = 30  
+annot_pri_pA_df = as.data.frame(annot_primirs) %>%
+                  mutate(primir_id = paste(gene_id),
+                         pA_coordinate = ifelse(strand == "+", end, start),
+                         pA_window_start = ifelse(strand == "+", end - upstream_width, start - downstream_width),
+                         pA_window_end = ifelse(strand == "+", end + downstream_width, start + upstream_width)) %>%
+                  select(primir_id, seqnames, strand, pA_coordinate, pA_window_start, pA_window_end, start, end) %>%
+                  mutate(queryHits = 1:n())
+
+annot_pri_pA = GenomicRanges::GRanges(seqnames = annot_pri_pA_df$seqnames, 
+                                      ranges = IRanges::IRanges(start = annot_pri_pA_df$pA_window_start,
+                                                                 end = annot_pri_pA_df$pA_window_end), 
+                                      strand = annot_pri_pA_df$strand,
+                                      tx_start = annot_pri_pA_df$start,
+                                      tx_end = annot_pri_pA_df$end)
+```
+
+pA sites of protein coding genes
+```{r}
+annot_Tian_df = read.csv("./Tian_annotation_protein_coding.csv.gz") %>%
+                mutate(pA_window_start = region_start - 30,
+                       pA_window_end = region_end + 30) %>%
+                mutate(subjectHits = 1:dim(.)[1])
+
+annot_Tian = GenomicRanges::GRanges(seqnames = annot_Tian_df$chr, 
+                                    ranges = IRanges::IRanges(start = annot_Tian_df$pA_window_start,
+                                                              end = annot_Tian_df$pA_window_end), 
+                                    strand = annot_Tian_df$strand,
+                                    gene = annot_Tian_df$gene)
+```
+
+Upload GENCODE annotation for protein coding genes. 
+Download a human comprehensive annotation from GENCODE website
+```{r}
+gencode = rtracklayer::import('./gencode.vXX.annotation.gtf')
+
+annot_genes = gencode[gencode$gene_type == "protein_coding"]
+annot_genes = annot_genes[annot_genes$type == "gene"]
+annot_genes_df = as.data.frame(annot_genes) %>%
+                         select(gene_name, gene_type, source, seqnames, start, end) %>%
+                         dplyr::rename(chr = seqnames,
+                                       tx_start = start,
+                                       tx_end = end) %>%
+                         mutate(subjectHits = 1:dim(.)[1])
+        
+annot_MIR = gencode[grepl("^MIR", gencode$gene_name)]
+annot_MIR = annot_MIR[annot_MIR$type == "gene" & annot_MIR$gene_type == "miRNA"]
+annot_MIR_df = as.data.frame(annot_MIR) %>% 
+                       select(gene_name, gene_type, source, seqnames, start, end) %>%
+                       dplyr::rename(chr = seqnames,
+                                     hairpin_start = start,
+                                     hairpin_end = end) %>%
+                       mutate(subjectHits = 1:dim(.)[1])
+
+```
+
+Overlap precursor and primary miRNA annotations.
+```{r}
+overlap_df = data.frame(GenomicAlignments::findOverlaps(annot_primirs, annot_MIR))
+upstream_width = 40
+downstream_width = 30
+annot_pri_pre_tmp_df = overlap_df %>%
+                       left_join(annot_primirs_df, by = "queryHits") %>%
+                       left_join(annot_MIR_df, by = "subjectHits") %>%
+                       group_by(gene_id, chr, strand, start, end, width) %>%
+                       summarize(miR_name = paste(gene_name, collapse = ';'),
+                                 miR_type = paste(gene_type, collapse = ';'),
+                                 hairpin_start = paste(hairpin_start, collapse = ';'),
+                                 hairpin_end = paste(hairpin_end, collapse = ';')) %>%
+                       mutate(miR_name = gsub("MIRLET", "let-", miR_name),
+                              miR_name = gsub("MIR", "miR-", miR_name)) %>%
+                       ungroup() %>%
+                       mutate(primir_id = paste(gene_id, miR_name, sep = "_"),
+                              pA_coordinate = ifelse(strand == "+", end, start),
+                              pA_window_start = ifelse(strand == "+", end - upstream_width, start - downstream_width),
+                              pA_window_end = ifelse(strand == "+", end + downstream_width, start + upstream_width)) %>%
+                       select(primir_id, miR_name, chr, strand, pA_coordinate, pA_window_start, pA_window_end, start, end) %>%
+                       mutate(queryHits = 1:dim(.)[1])
+
+annot_pri_pre_tmp = GenomicRanges::GRanges(seqnames = annot_pri_pre_tmp_df$chr, 
+                                           ranges = IRanges::IRanges(start = annot_pri_pre_tmp_df$pA_window_start,
+                                                                  end = annot_pri_pre_tmp_df$pA_window_end), 
+                                           strand = annot_pri_pre_tmp_df$strand,
+                                           primir_id = annot_pri_pre_tmp_df$miR_name)
+
+overlap_df = data.frame(GenomicAlignments::findOverlaps(annot_pri_pre_tmp, annot_pri_pre_tmp)) %>%
+             filter(queryHits != subjectHits)
+miR_cluster_df = data.frame()
+processed_miR_index = c()
+idx = 1
+for (queryhit in unique(overlap_df$queryHits)) {
+  if (queryhit %% 100 == 0) {
+    print(queryhit)
+  }
+  if (queryhit %in% processed_miR_index) {
+    next
+  }
+  overlap_subset_df = overlap_df[overlap_df$queryHits == queryhit,]
+  processed_miR_index = c(processed_miR_index, overlap_subset_df$subjectHits)
+  
+  append_df = data.frame(queryHits = c(queryhit, overlap_subset_df$subjectHits),
+                         clusterID = idx)
+  miR_cluster_df = bind_rows(miR_cluster_df, append_df)
+  idx = idx + 1
+}
+
+annot_pri_pre_df = miR_cluster_df %>% 
+                   left_join(annot_pri_pre_tmp_df) %>%
+                   group_by(clusterID) %>%
+                   summarise(primir_id = paste(unique(miR_name), collapse = ';'),
+                             pA_window_start = min(pA_window_start),
+                             pA_window_end = max(pA_window_end),
+                             chr = dplyr::first(chr),
+                             strand = dplyr::first(strand)) %>%
+                   mutate(primir_id = paste(clusterID, primir_id, sep = "_")) %>%
+                   select(-clusterID) %>%
+                   mutate(queryHits = 1:dim(.)[1])
+annot_pri_pre = GenomicRanges::GRanges(seqnames = annot_pri_pre_df$chr, 
+                                           ranges = IRanges::IRanges(start = annot_pri_pre_df$pA_window_start,
+                                                                  end = annot_pri_pre_df$pA_window_end), 
+                                           strand = annot_pri_pre_df$strand,
+                                           primir_id = annot_pri_pre_df$primir_id)
+```
+
+
+Overlap pA sites for pri-miRNAs and protein coding genes or with gencode mRNA/lncRNA annotations
+```{r}
+overlap_df = data.frame(GenomicAlignments::findOverlaps(annot_pri_pre, annot_Tian))
+primir_intragenic_df = overlap_df %>%
+                       left_join(annot_pri_pre_df, by = "queryHits") %>%
+                       left_join(annot_Tian_df, by = "subjectHits") %>%
+                       mutate(column_to_split = primir_id) %>%
+                       tidyr::separate(column_to_split, c("mendel_annot", "miR_name"), sep = "_")
+primirs_to_delete = unique(primir_intragenic_df$miR_name)
+```
+
+Construct saf pri-miRNA pA sites annotation file for quantification 
+with featureCounts on a cluster
+```{r}
+saf = annot_pri_pre_df %>%
+      mutate(column_to_split = primir_id) %>%
+      tidyr::separate(column_to_split, c("clusterID", "miR_name"), "_") %>%
+      filter(!(miR_name %in% primirs_to_delete)) %>%
+      select(-miR_name, -clusterID) %>%
+      mutate(chr = paste(chr, "_hs", sep = "")) %>%
+      select(primir_id, chr, pA_window_start, pA_window_end, strand)
+colnames(saf) = c("GeneID", "Chr", "Start", "End", "Strand")
+```

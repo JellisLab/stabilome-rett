@@ -1,0 +1,178 @@
+---
+title: "Buffering of transcription rate shifts"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Upload transcription rate, steady state and half-life data
+```{r}
+TR_tbl = read.csv("./TR_log2FC_deseq2.csv.gz",
+                  header = T)
+SS_tbl = read.csv("./SS_log2FC_deseq2.csv.gz",
+                  header = T)
+
+colnames(TR_tbl) = gsub("_Neu_RTT_WT", "_TR", colnames(TR_tbl))
+colnames(SS_tbl) = gsub("_Neu_RTT_WT", "_SS", colnames(SS_tbl))
+
+# We also tried to estimate SS/TR fold change with a DESeq2
+# from interaction term celltype:assay in a design:
+# ~ celltype + replicate + assay + celltype:assay
+# Here assay is a factor with values c(SS, TR)
+SS_TR_tbl = read.csv("./SS_TR_deseq2.csv.gz", header = T) %>%
+            mutate(log2FC_SS_TR = log2_SS_TR_Neu_RTT - log2_SS_TR_Neu_WT) %>%
+            select(gene, log2FC_SS_TR)
+
+normed_avg_tbl = read.csv("./normed_avg_counts.csv.gz",
+                      header = T) %>%
+                 select(gene, contains("SS"))
+```
+
+Define thresholds for a sufficient log2FC
+```{r}
+TR_tbl = TR_tbl %>%
+         mutate(padj_TR = ifelse(is.na(padj_TR), 1, padj_TR),
+                TR_DEA_status = "Not",
+                TR_DEA_status = ifelse(log2FC_TR > 0 & padj_TR < 0.1,
+                                       "Up", TR_DEA_status),
+                TR_DEA_status = ifelse(log2FC_TR < 0 & padj_TR < 0.1,
+                                       "Down", TR_DEA_status))
+
+SS_tbl = SS_tbl %>%
+         mutate(padj_SS = ifelse(is.na(padj_SS), 1, padj_SS),
+                SS_DEA_status = "Not",
+                SS_DEA_status = ifelse(log2FC_SS > 0 & padj_SS < 0.1,
+                                       "Up", SS_DEA_status),
+                SS_DEA_status = ifelse(log2FC_SS < 0 & padj_SS < 0.1,
+                                       "Down", SS_DEA_status))
+
+RATE_tbl = full_join(TR_tbl, SS_tbl) %>%
+           select(gene, log2FC_TR, log2FC_SS, TR_DEA_status, SS_DEA_status)
+```
+
+Tidy log2FC data for a heatmap
+```{r}
+RATE_clean = RATE_tbl %>%
+              mutate(TR_na = is.na(log2FC_TR),
+                     SS_na = is.na(log2FC_SS),
+                     log2FC_SS = ifelse(SS_na & !TR_na,
+                                        0, log2FC_SS),
+                     SS_DEA_status = ifelse(SS_na & !TR_na,
+                                            "Not", SS_DEA_status),
+                     log2FC_TR = ifelse(TR_na & !SS_na,
+                                        0, log2FC_TR),
+                     TR_DEA_status = ifelse(TR_na & !SS_na,
+                                            "Not", TR_DEA_status)) %>%
+              na.omit() %>%
+              filter(TR_DEA_status != "Not" | 
+                     SS_DEA_status != "Not") %>%
+              # Reduce fold-change value by 1/2 for visual purpose
+              mutate(log2FC_TR = ifelse(TR_DEA_status == "Not",
+                                        0.5*log2FC_TR,
+                                        log2FC_TR),
+                     log2FC_SS = ifelse(SS_DEA_status == "Not",
+                                        0.5*log2FC_SS,
+                                        log2FC_SS)) %>%
+              select(-TR_na, -SS_na)
+
+# Reshape the data
+RATE_melt = reshape2::melt(RATE_clean,
+                           id.vars = c("gene", "TR_DEA_status", "SS_DEA_status")) %>%
+            mutate(variable = gsub("log2FC_", "", variable),
+                   variable = factor(variable,
+                                     levels=c("TR", "SS")))
+```
+
+Define heatmap groups
+```{r}
+heatmap_data = RATE_melt %>%
+               group_by(gene) %>%
+               mutate(SS_TR_DEA_status = ifelse(abs(value[variable == "SS"] - value[variable == "TR"])/abs(value[variable == "TR"]) > 0.25, 
+                                                "Yes", "Not")) %>%
+               ungroup() %>%
+               mutate(SS_DEA_status = ifelse(SS_DEA_status=="Up" & TR_DEA_status=="Up" & (SS_TR_DEA_status=="Not"),
+                                             "Pure_TR_Up", SS_DEA_status),
+                      SS_DEA_status = ifelse(SS_DEA_status=="Down" & TR_DEA_status=="Down" & (SS_TR_DEA_status=="Not"),
+                                             "Pure_TR_Down", SS_DEA_status),
+                      # There 3 genes with opposite TR and SS shifts
+                      SS_DEA_status = ifelse(SS_DEA_status=="Down" & TR_DEA_status=="Up",
+                                             "Up", SS_DEA_status),
+                      SS_DEA_status = ifelse(SS_DEA_status=="Up" & TR_DEA_status=="Down",
+                                             "Down", SS_DEA_status)) %>%
+               mutate(value = (e1071::sigmoid(0.5*value) - 0.5))
+```
+
+Sort genes
+```{r}
+genes = (heatmap_data %>%
+         filter(variable == "TR") %>%
+         arrange(TR_DEA_status, SS_DEA_status, value) %>%
+         mutate(gene = factor(gene, levels=unique(gene))))$gene
+heatmap_data = heatmap_data %>%
+               mutate(gene = factor(gene, levels=genes))
+```
+
+Visualize buffering heatmap
+```{r}
+borders = (heatmap_data %>%
+             filter(variable == "TR") %>%
+             group_by(TR_DEA_status, SS_DEA_status) %>%
+             summarise(n=n()))$n
+  
+ggplot(data = heatmap_data,
+       aes(x = variable,
+           y = gene,
+           fill = value)) +
+  geom_tile() +
+  geom_hline(yintercept = cumsum(borders)) +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_fill_gradient2(low = "#59AE48", mid = "white", high = "#FF6699",
+                       breaks = c(-0.4241418, -0.2772999, 0, 0.2772999, 0.4241418),
+                       labels = c(-5, -2.5, 0, 2.5, 5),
+                       name = latex2exp::TeX("$log_{2}$(FC)"))
+```
+
+Visualize buffering boxplot
+```{r}
+boxplot_data = full_join(TR_tbl, SS_TR_tbl) %>%
+               full_join(normed_avg_tbl) %>%
+               # Keep genes that are sufficiently abundand
+               # in at least one cell type
+               filter(!is.na(TR_DEA_status),
+                      Neu_WT_SS > quantile(Neu_WT_SS, 0.1) |
+                      Neu_RTT_SS > quantile(Neu_RTT_SS, 0.1)) %>%
+               mutate(TR_DEA_status = factor(TR_DEA_status,
+                                             levels=c("Up", "Not", "Down")))
+
+ggplot(data = boxplot_data,
+         aes(x = TR_DEA_status,
+             y = log2FC_SS_TR,
+             fill = TR_DEA_status)) +
+    geom_hline(yintercept = 0) +
+    geom_boxplot(notch = T, outlier.size = 0.1) +
+    xlab(latex2exp::TeX("transcription rate, $log_{2} \\frac{RTT}{WT}$")) +
+    ylab(latex2exp::TeX("half-life, $log_{2} \\frac{RTT}{WT}$")) +
+    ggthemes::theme_base() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_fill_manual(values = c("#FF3EAA", "grey", "#00B42A")) +
+    coord_cartesian(ylim = c(-2.7, 2.7)) 
+```
+
+
+
+
+
+

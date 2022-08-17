@@ -1,0 +1,114 @@
+---
+title: "Analysis of primary and mature microRNA data"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+```
+
+Upload miRNA data
+```{r}
+DEA_miRNA = read.csv("./miRNA.DEA.csv.gz")
+miRNA = read.csv("./miRNA.collapsed_to_mature.csv.gz")
+```
+
+Annotate spike-ins
+```{r}
+DEA_miRNA = DEA_miRNA %>%
+            mutate(endogenous = !grepl("Un", Mature),
+                   endogenous = factor(endogenous, levels=c(T, F)))
+```
+
+Visualize endogenous and spike-in microRNA fold-changes
+```{r}
+ggplot(data = DEA_miRNA,
+       aes(x = endogenous,
+           y = log2FC,
+           fill = endogenous)) +
+  geom_boxplot(notch = T,
+               outlier.size = 0.1) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#BFBFBF", "#5D3FD3")) +
+  coord_cartesian(ylim = c(-1.7, 1.7)) +
+  ylab(latex2exp::TeX("fold-change, $log_{2}$")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        plot.background = element_rect(fill = "white", colour = "white", size = 1))
+
+
+correction_factor = (DEA_miRNA %>%
+                      filter(endogenous == F) %>%
+                      summarise(correction_factor = -median(log2FC, na.rm = T)))$correction_factor
+ggplot(data = DEA_miRNA %>%
+              filter(endogenous == T) %>% 
+              mutate(correction_factor),
+       aes(y = log2FC + correction_factor)) +
+  geom_boxplot(notch = T, fill = "#5D3FD3", alpha = 0.5,
+               outlier.size = 0.1) +
+  geom_hline(yintercept = 0) +
+  ggthemes::theme_base() +
+  scale_fill_manual(values = c("#BFBFBF", "#FF0019")) +
+  coord_cartesian(ylim = c(-1.7, 1.7)) +
+  ylab(latex2exp::TeX("fold-change, $log_{2}$")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Visualize a scatter plot
+```{r}
+miR_tbl = miRNA %>% select(-Mature)
+column.data = data.frame(celltype = c("Neu_WT", "Neu_WT", "Neu_RTT", "Neu_RTT"), 
+                         row.names = colnames(miR_tbl))
+
+# Create DESeqDataSet object from matrix with counts
+dds = DESeq2::DESeqDataSetFromMatrix(countData = miR_tbl %>% mutate_if(is.numeric, as.integer),
+                                     colData = column.data,
+                                     design =~ celltype)
+
+# Calculate MLE log2FC
+dds = DESeq2::DESeq(dds)
+
+res = DESeq2::results(dds, contrast=c("celltype", "Neu_RTT", "Neu_WT"))
+res = data.frame(res) %>%
+      mutate(gene = miRNA[,c(1)]) %>%
+      select(gene, baseMean, log2FoldChange, lfcSE, pvalue, padj) %>%
+      mutate(padj = ifelse(-log(padj,10) > 45, 1e-45, padj),
+             padj = ifelse(is.na(padj), 1, padj))
+
+
+
+neuron_mirna = c("miR-124-", "miR-137-", "miR-22-", "miR-7-", "miR-9-")
+plot_mirna = rbind(res %>% filter(!grepl("Un", gene)) %>%
+                           mutate(type = "endogenous"),
+                   res %>% filter(grepl("Un", gene)) %>%
+                           mutate(type = "spike-in"),
+                   res %>% filter(apply(sapply(X = neuron_mirna, FUN = function(x) grepl(x, gene)), 
+                                        1, FUN = function(x) any(x))) %>%
+                           mutate(type = "Neu"))
+
+
+ggplot(data = plot_mirna,
+       aes(x = log(baseMean, 10),
+           y = log2FoldChange,
+           fill = type,
+           alpha = type)) +
+  geom_point(color = "black", pch=21, size = 2) +
+  scale_fill_manual(values = c("black", "dodgerblue1", "red")) +
+  scale_alpha_manual(values = c(0.3, 1, 1, 1)) +
+  ggthemes::theme_base(base_size = 20) +
+  geom_hline(yintercept = 0, color = "red") +
+  coord_cartesian(ylim = c(-4,4)) +
+  xlab(latex2exp::TeX("$log_{2} (basemean)$")) +
+  ylab(latex2exp::TeX("$log_{2} \\frac{RTT}{WT}$, counts"))
+```
+
+
+
+

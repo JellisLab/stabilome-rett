@@ -1,0 +1,323 @@
+---
+title: "Train random forest model for transcription rate shifts"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+```
+
+Upload transcription rate and k-mers data
+```{r}
+TR_tbl = read.csv("./TR_log2FC_deseq2.csv.gz",
+                  header = T)
+colnames(TR_tbl) = gsub("_Neu_RTT_WT", "_TR", colnames(TR_tbl))
+
+CDS_kmer = read.csv("./CDS_hs_kmer.csv.gz",
+                    header = T)
+genebody_kmer = read.csv("./genebody_hs_kmer.csv.gz",
+                    header = T)
+```
+
+Define response variable Y for a random forest classifier based on transcription rate changes
+```{r}
+TR_data = TR_tbl %>%
+          mutate(Y = NA,
+                 Y = ifelse(log2FC_TR > 1 & padj_TR < 0.1,
+                            "Up", Y),
+                 Y = ifelse(log2FC_TR < -1 & padj_TR < 0.1,
+                            "Down", Y)) %>%
+          filter(Y %in% c("Up", "Down")) %>%
+          select(gene, Y)
+```
+
+Maybe equalize Y group sizes
+```{r}
+equalize_groups <- function(.data) {
+  output = .data %>%
+    na.omit() %>%
+    group_by(Y) %>%
+    mutate(N = n()) %>%
+    ungroup() %>%
+    mutate(N = min(N)) %>%
+    group_by(Y) %>%
+    sample_n(N) %>%
+    select(-N)
+  
+  return(output)
+}
+
+TR_EQ_data = equalize_groups(TR_data)
+```
+
+Prepare data for different random forest models
+```{r}
+RF_model = list()
+RF_model[["CDS_L"]] = full_join(TR_EQ_data, CDS_kmer[, c(1:2)]) %>%
+  select(-gene)
+RF_model[["CDS_dinuc"]] = full_join(TR_EQ_data, CDS_kmer[, c(1, 3:18)]) %>%
+  select(-gene)
+RF_model[["CDS_sixnuc"]] = full_join(TR_EQ_data, CDS_kmer[, c(1, 19:1042)]) %>%
+  select(-gene)
+RF_model[["CDS_L_dinuc"]] = full_join(TR_EQ_data, CDS_kmer[, c(1:2, 3:18)]) %>%
+  select(-gene)
+RF_model[["CDS_L_sixnuc"]] = full_join(TR_EQ_data, CDS_kmer[, c(1:2, 19:1042)]) %>%
+  select(-gene)
+RF_model[["genebody_L"]] = full_join(TR_EQ_data, genebody_kmer[, c(1:2)]) %>%
+  select(-gene)
+RF_model[["genebody_dinuc"]] = full_join(TR_EQ_data, genebody_kmer[, c(1, 3:18)]) %>%
+  select(-gene)
+RF_model[["genebody_sixnuc"]] = full_join(TR_EQ_data, genebody_kmer[, c(1, 19:1042)]) %>%
+  select(-gene)
+RF_model[["genebody_L_dinuc"]] = full_join(TR_EQ_data, genebody_kmer[, c(1:2, 3:18)]) %>%
+  select(-gene)
+RF_model[["genebody_L_sixnuc"]] = full_join(TR_EQ_data, genebody_kmer[, c(1:2, 19:1042)]) %>%
+  select(-gene)
+```
+
+Train random forest classifiers
+```{r}
+output_models = list()
+for (model_type in names(RF_model)) {
+  print(paste("working on", model_type, sep = " "))
+  
+  data = RF_model[[model_type]] %>%
+         na.omit() %>%
+         mutate(Y = factor(Y))
+  print(paste("dim(data): ", dim(data), sep = ""))
+  
+  sample = caTools::sample.split(data$Y, SplitRatio = .75)
+  train = subset(data, sample == TRUE)
+  test  = subset(data, sample == FALSE)
+  
+  rf <- randomForest::randomForest(
+    Y ~ .,
+    data = train,
+    importance = T
+  )
+  
+  output_list = list(rf, 
+                     caret::confusionMatrix(predict(rf, test), test$Y),
+                     test)
+  output_models[[model_type]] = output_list
+}
+```
+
+Plot models accuracy
+```{r}
+accuracy_df = data.frame(matrix(nrow = 0, ncol = 3))
+accuracy_error_df = data.frame(matrix(nrow = 0, ncol = 3))
+for (model_type in names(output_models)) {
+  rf = output_models[[model_type]][[1]]
+  cfm = output_models[[model_type]][[2]]
+  test = output_models[[model_type]][[3]]
+  
+  acc_balanced = cfm$byClass["Balanced Accuracy"]
+  acc_overall = cfm$overall[1]
+  acc_lower = cfm$overall[3]
+  acc_upper = cfm$overall[4]
+  
+  accuracy_df = rbind(accuracy_df,
+                      data.frame(model_type, acc_balanced, acc_overall))
+  accuracy_error_df = rbind(accuracy_error_df,
+                            data.frame(model_type, acc_lower, acc_upper))
+}
+accuracy_2Y_low_melt = reshape2::melt(accuracy_error_df[,1:2]) %>%
+                       mutate(variable = "acc_overall") %>%
+                       dplyr::rename(value_low = value)
+accuracy_2Y_up_melt = reshape2::melt(accuracy_error_df[,c(1,3)]) %>%
+                      mutate(variable = "acc_overall") %>%
+                      dplyr::rename(value_up = value)
+accuracy_2Y_melt = reshape2::melt(accuracy_df) %>%
+                   left_join(accuracy_2Y_low_melt) %>%
+                   left_join(accuracy_2Y_up_melt) %>%
+                   mutate(model_type = factor(model_type,
+                                              levels = c("CDS_L", "CDS_dinuc", "CDS_sixnuc", 
+                                                         "CDS_L_dinuc", "CDS_L_sixnuc",
+                                                         "genebody_L", "genebody_dinuc", 
+                                                         "genebody_sixnuc", "genebody_L_dinuc",
+                                                         "genebody_L_sixnuc")))
+
+ggplot(data = accuracy_2Y_melt %>%
+              filter(variable == "acc_overall"),
+       aes(x = model_type,
+           y = value,
+           color = variable)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = value_low,
+                    ymax = value_up),
+                width = 0.5) +
+  geom_hline(yintercept = 0.5) +
+  coord_cartesian(ylim = c(0.4, 0.8)) +
+  ggthemes::theme_base(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylab("accuracy")
+```
+
+Plot ROC PRC plots
+```{r}
+precrec_output = data.frame(matrix(nrow = 0, ncol = 4))
+for (model_type in names(output_models)[1:10]) {
+  rf = output_models[[model_type]][[1]]
+  test = output_models[[model_type]][[3]]
+  
+  precrec_obj <- precrec::evalmod(scores = predict(rf, test, type = "prob")[,2], labels = test$Y)
+  precrec_data = precrec_obj$rocs[[1]]
+  output_rocs = data.frame(x = precrec_data$x,
+                           y = precrec_data$y,
+                           model_type = model_type,
+                           assay = "rocs")
+  
+  precrec_data = precrec_obj$prcs[[1]]
+  output_prcs = data.frame(x = precrec_data$x,
+                           y = precrec_data$y,
+                           model_type = model_type,
+                           assay = "prcs")
+  
+  output = rbind(output_rocs, output_prcs)
+  
+  precrec_output = rbind(precrec_output, output)
+}
+
+pal = wesanderson::wes_palette("Zissou1", 10, type = "continuous")
+ggplot(data = precrec_output %>%
+              mutate(assay = factor(assay, levels = c("rocs", "prcs")),
+                     model_type = factor(model_type))) +
+  geom_line(aes(x = x,
+                y = y,
+                color = model_type)) +
+  geom_abline(data = data.frame(assay = "rocs", s = 1, i = 0) %>%
+                     mutate(assay = factor(assay, levels = c("rocs", "prcs"))),
+              aes(slope = s,
+                  intercept = i)) +
+  geom_hline(data = data.frame(assay = "prcs", y = 0.5) %>%
+               mutate(assay = factor(assay, levels = c("rocs", "prcs"))),
+             aes(yintercept = y)) +
+  facet_wrap(~assay) +
+  ggthemes::theme_base(base_size = 24) +
+  scale_color_manual(values = c(pal)) +
+  theme(plot.background = element_rect(
+    fill = "white",
+    colour = "white",
+    size = 1
+  )) +
+  scale_x_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1),
+                     labels = c(0, 0.25, 0.5, 0.75, 1)) +
+  scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1),
+                     labels = c(0, 0.25, 0.5, 0.75, 1))
+```
+
+
+
+To collect data for Fig 2D we used 100 resampling. And plotted average model accuracy.
+```{r}
+library(foreach)
+library(doParallel)
+
+accuracy_2Y_summary = data.frame()
+data = full_join(TR_EQ_data, genebody_kmer[, c(1, 3:18)]) %>%
+       select(-gene)
+
+for (combosize in c(2, 3)) {
+  print(combosize)
+  combo_matrix = combn(c(2:17), combosize)
+  
+  RF_model = list()
+  num_resamplings = 2
+  # In the actual code num_resamplings = 100
+  for (ind in 1:dim(combo_matrix)[2]) {
+    combo_indices = combo_matrix[, ind]
+    for (rep in 1:num_resamplings) {
+      model_name = colnames(data)[combo_indices]
+      model_name = paste(model_name, collapse = "_")
+      model_name = paste(model_name, rep, sep = "_")
+      RF_model[[model_name]] = data[, c(1, combo_indices)]
+    }
+  }
+  
+  num_models = length(RF_model)
+  # This code was exectued in parallel on a cluster with 32 cores
+  accuracy_2Y <- foreach(model_idx=1:num_models, .combine=rbind) %dopar% {
+    # Load data
+    model_type = names(RF_model)[model_idx]
+    data = RF_model[[model_type]] %>%
+           na.omit() %>%
+           mutate(Y = factor(Y))
+    
+    # Split data
+    sample = caTools::sample.split(data$Y, SplitRatio = .75)
+    train = subset(data, sample == TRUE)
+    test  = subset(data, sample == FALSE)
+    
+    # Train random forest
+    rf <- randomForest::randomForest(
+      Y ~ .,
+      data = train
+    )
+    
+    # Test model on held out data
+    cfm = caret::confusionMatrix(predict(rf, test), test$Y)
+    acc_balanced = cfm$byClass["Balanced Accuracy"]
+    acc_overall = cfm$overall[1]
+    acc_lower = cfm$overall[3]
+    acc_upper = cfm$overall[4]
+    
+    data.frame(model_type, acc_balanced, acc_overall, acc_lower, acc_upper, combosize)
+  }
+  
+  accuracy_2Y_summary = rbind(accuracy_2Y_summary, accuracy_2Y)
+}
+```
+
+Visualize random forest model accuracy based on a combination of 2 or 3 dinucleotides
+```{r}
+accuracy_2Y = accuracy_2Y_summary %>%
+              mutate(rep = gsub("[A-Z][A-Z]|_", "", model_type),
+                     model_type = gsub("_100|_[1-9][0-9]|_[1-9]", "", model_type))
+
+
+accuracy_2Y_stats = accuracy_2Y %>%
+                    mutate(combosize = as.character(combosize)) %>%
+                    group_by(model_type, combosize) %>%
+                    summarise(acc_avg = median(acc_overall),
+                              acc_sd = sd(acc_overall),
+                              acc_se = sd(acc_overall)/sqrt(n()))
+
+highlight_models = accuracy_2Y_stats %>%
+                   mutate(combosize = as.character(combosize)) %>%
+                   group_by(combosize) %>%
+                   top_n(n = 4, wt = acc_avg) %>%
+                   select(combosize, model_type) %>%
+                   mutate(value_status = T)
+
+position = ggbeeswarm::position_quasirandom()
+ggplot(data = accuracy_2Y_stats %>%
+              left_join(highlight_models) %>%
+              mutate(value_status = ifelse(is.na(value_status), F, value_status),
+                     model_type = ifelse(!value_status, "", model_type)),
+       aes(x = combosize,
+           y = acc_avg,
+           label = model_type,
+           color = value_status)) +
+  geom_point(size = 0.5,
+             position = position) +
+  geom_hline(yintercept = 0.674) +
+  ggrepel::geom_text_repel(position = position, size = 1.5, color = "red",
+                           min.segment.length = 0.1,
+                           max.overlaps = 20) +
+  scale_color_manual(values = c("black", "red")) +
+  ggthemes::theme_base(base_size = 20) +
+  coord_cartesian(ylim = c(0.5, 0.7)) +
+  xlab("Combination size") +
+  ylab("Accuracy")
+```
+
+
+

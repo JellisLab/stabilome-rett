@@ -1,0 +1,390 @@
+---
+title: "Estimate transcription rate and half-life from counts"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(DESeq2)
+library(dplyr)
+```
+
+Upload drosophila normalized counts data
+Column name format: Celltype_Genotype_Timepoint_Replicate
+```{r}
+normed_tbl = read.csv("./normed_counts.csv.gz",
+                      header = T)
+normed_avg_tbl = read.csv("./normed_avg_counts.csv.gz",
+                      header = T)
+```
+
+
+## Estimate transcription rate (TR) log2 fold-change
+
+
+Prepare matrix for DESeq2.
+```{r}
+include_pseudoreplicate = TRUE
+
+# Depending on your experiment design, consider excluding a pseudoreplicate
+if (include_pseudoreplicate) {
+  gene.counts = normed_tbl %>% 
+                select(gene, contains("_0.5_"), contains("_1_")) %>%
+                group_by(gene) %>%
+                summarise_all(sum, na.rm = T) %>%
+                mutate_at(vars(contains("_1_")), function(x) {x/2})
+} else {
+  gene.counts = normed_tbl %>% 
+                select(gene, contains("_0.5_")) %>%
+                group_by(gene) %>%
+                summarise_all(sum, na.rm = T)
+}
+
+# Remove names of the genes 
+counts.data = gene.counts[,c(2:ncol(gene.counts))]
+
+# Convert counts dataframe to matrix and append gene names
+counts.data = as.matrix(counts.data)
+row.names(counts.data) = gene.counts$gene
+```
+
+
+Run DESeq2
+```{r}
+# Choose cell types
+cellA = "Neu_WT"
+cellB = "Neu_RTT"
+
+# Indices for subsets
+A_indices = grepl(x = colnames(counts.data), pattern = cellA)
+B_indices = grepl(x = colnames(counts.data), pattern = cellB)
+
+# Select data for each assay and celltype
+subset_A = counts.data[, A_indices]
+subset_B = counts.data[, B_indices]
+
+# [Optional] Quantile normalize ranges between replicates
+columns_A = colnames(subset_A)
+subset_A = preprocessCore::normalize.quantiles(as.matrix(subset_A))
+subset_A = data.frame(subset_A)
+colnames(subset_A) = columns_A
+columns_B = colnames(subset_B)
+subset_B = preprocessCore::normalize.quantiles(as.matrix(subset_B))
+subset_B = data.frame(subset_B)
+colnames(subset_B) = columns_B
+
+# Merge Trap and Input data
+# Convert data to counts.
+subset = cbind(subset_A, subset_B) %>% 
+         # Convert back to raw counts
+         # Not necessary, if you start with raw counts data
+         mutate_if(is.numeric, function(x) {as.integer(x/min(na_if(x, 0), na.rm = T))})
+
+# Prepare samples for DESeq
+samples = colnames(subset)
+column.data = data.frame(samples,
+                         celltype = gsub("_0.5|_1|_A|_B", "", samples),
+                         row.names = samples)
+
+# Create DESeqDataSet object from matrix with counts
+dds = DESeq2::DESeqDataSetFromMatrix(countData = subset,
+                                     colData = column.data,
+                                     design =~ celltype)
+
+# Run DESeq pipeline
+dds = DESeq2::DESeq(dds)
+
+# Prepare a dataframe with results
+res = DESeq2::results(dds, contrast=c("celltype", cellB, cellA))
+TR_shifts = data.frame(res) %>%
+            mutate(gene = row.names(counts.data)) %>%
+            select(gene, log2FoldChange, lfcSE, pvalue, padj)
+
+# Rename columns
+colnames(TR_shifts) = c("gene", 
+                      paste0(c("log2FC_", "lfcSE_", "pvalue_", "padj_"), "Neu_RTT_WT"))
+
+# Save data
+write.csv(TR_shifts, "./TR_log2FC_deseq2.csv", 
+          quote = F, row.names = F)
+```
+
+
+## Estimate steady state (SS) log2 fold-change
+
+
+Prepare matrix for DESeq2.
+```{r}
+gene.counts = normed_tbl %>% 
+                select(gene, contains("SS")) %>%
+                group_by(gene) %>%
+                summarise_all(sum, na.rm = T)
+
+# Remove names of the genes 
+counts.data = gene.counts[,c(2:ncol(gene.counts))] %>%
+              mutate_if(is.numeric, as.integer)
+
+# Convert counts dataframe to matrix and append gene names
+counts.data = as.matrix(counts.data)
+row.names(counts.data) = gene.counts$gene
+```
+
+
+Run DESeq2
+```{r}
+# Choose cell types
+cellA = "Neu_WT"
+cellB = "Neu_RTT"
+
+# Indices for subsets
+A_indices = grepl(x = colnames(counts.data), pattern = cellA)
+B_indices = grepl(x = colnames(counts.data), pattern = cellB)
+
+# Select data for each assay and celltype
+subset_A = counts.data[, A_indices]
+subset_B = counts.data[, B_indices]
+
+# Merge Trap and Input data
+# Convert data to counts.
+subset = cbind(subset_A, subset_B) 
+         # Convert back to counts
+         # Not necessary, if you start with raw counts data
+         #as.data.frame() %>%
+         #mutate_if(is.numeric, function(x) {as.integer(x/min(na_if(x, 0), na.rm = T))})
+
+# Prepare samples for DESeq
+samples = colnames(subset)
+column.data = data.frame(samples,
+                         celltype = gsub("_SS|_A|_B", "", samples),
+                         row.names = samples)
+
+# Create DESeqDataSet object from matrix with counts
+dds = DESeq2::DESeqDataSetFromMatrix(countData = subset,
+                                     colData = column.data,
+                                     design =~ celltype)
+
+# Run DESeq pipeline
+dds = DESeq2::DESeq(dds)
+
+# Prepare a dataframe with results
+res = DESeq2::results(dds, contrast=c("celltype", cellB, cellA))
+SS_shifts = data.frame(res) %>%
+            mutate(gene = row.names(counts.data)) %>%
+            select(gene, log2FoldChange, lfcSE, pvalue, padj)
+
+# Rename columns
+colnames(SS_shifts) = c("gene", 
+                      paste0(c("log2FC_", "lfcSE_", "pvalue_", "padj_"), "Neu_RTT_WT"))
+
+# Save data
+write.csv(SS_shifts, "./SS_log2FC_deseq2.csv", 
+          quote = F, row.names = F)
+```
+
+
+## Estimate half-life with a ratio method
+
+
+Prepare matrix for DESeq2
+```{r}
+include_pseudoreplicate = FALSE
+
+
+if (include_pseudoreplicate) {
+  gene.counts = normed_tbl %>% 
+                select(gene, contains("SS"), contains("_0.5_"), contains("_1_")) %>%
+                group_by(gene) %>%
+                summarise_all(sum, na.rm = T) %>%
+                mutate_at(vars(contains("_1_")), function(x) {x/2})
+} else {
+  gene.counts = normed_tbl %>% 
+                select(gene, contains("SS"), contains("_0.5_")) %>%
+                group_by(gene) %>%
+                summarise_all(sum, na.rm = T)
+}
+
+# Remove names of the genes 
+counts.data = gene.counts[,c(2:ncol(gene.counts))]
+
+# Convert counts dataframe to matrix and append gene names
+counts.data = as.matrix(counts.data)
+row.names(counts.data) = gene.counts$gene
+```
+
+
+Run DESeq2
+```{r}
+samples.list = list()
+celltypes = c("Neu_WT", "Neu_RTT")
+for (ind in c(1:2)) {
+  # Pick cell types
+  cell = celltypes[ind]
+  
+  # Indices for subsets
+  indices = grepl(x = colnames(counts.data), pattern = cell)
+  
+  # Select data for each celltype
+  subset = as.data.frame(counts.data[, indices])
+  subset = subset %>%
+           mutate_if(is.numeric, function(x) {as.integer(x/min(na_if(x, 0), na.rm = T))})
+
+  # Prepare samples for DESeq
+  samples = colnames(subset)
+  column.data = data.frame(samples,
+                           assay = ifelse(grepl("SS", samples), "SS", "TR"),
+                           celltype = gsub("_0.5|_1|_A|_B|_SS", "", samples),
+                           row.names = samples) %>%
+                mutate(assay = factor(assay, levels = c("TR", "SS")))
+  
+  # Create DESeqDataSet object from matrix with counts
+  dds = DESeq2::DESeqDataSetFromMatrix(countData = subset,
+                                       colData = column.data,
+                                       design =~ assay)
+  
+  # Run DESeq pipeline
+  dds = DESeq2::DESeq(dds)
+  
+  res = DESeq2::results(dds)
+  res = data.frame(res) %>%
+        mutate(gene = row.names(counts.data)) %>%
+        select(gene, log2FoldChange, lfcSE, pvalue, padj)
+  samples.list[[cell]] = res
+}
+
+# Combine tables for each transition
+SS_TR_data = Reduce(x = samples.list, f = function(x, y) {full_join(x, y, by = "gene")})
+colnames(SS_TR_data) = c("gene", unlist(lapply(X = names(samples.list), 
+                                                 FUN = function(x) paste0(c("log2_SS_TR_", "lfcSE_", "pvalue_", "padj_"), x))))
+
+# Save table
+output = "./SS_TR_deseq2.csv"
+write.csv(SS_TR_data, output, row.names = F)
+```
+
+
+## Estimate half-life with saturation curve
+
+
+Define function for fitting a saturation curve. This functions is slow. It's better
+to run it on a cluster with multiple cores after adapting the code for parallel run in R. 
+```{r}
+estimate_HL <- function(ind, tbl, celltype) {
+  # Subset counts table
+  columns = grep(celltype, colnames(tbl))
+  times = c(0.5, 1, 4, 8, 24)
+  if (celltype == "Neu_RTT") {
+    times = c(0.5, 4, 8, 24)
+  }
+  
+  # Prepare counts data for fitting saturation curve
+  y = as.numeric(tbl[ind, columns])
+  t = times
+  
+  # In a first pass fit curve roughly without correcting for 
+  # dependence of variance on number of counts. Use rough fit to estimate 
+  # "true" number of counts Y at each timepoint. Then, correct for 
+  # increase in variance in second pass by setting weights W as follows:
+  # w = 1/variance ~ 1/Y
+  fit <- tryCatch(nls( y ~ C*( 1 - exp( k*t ) ),
+                       start=c( C=max(y), k=-0.1 ),
+                       lower=c(C=1,k=-5.0), upper=c(C=1e7,k=-0.01),
+                       control=list(warnOnly=T) ), 
+                  error=function(e) NULL )
+  
+  # If first pass works, create weights
+  if (is.null(fit)) {
+    output_vec = rep(NA, 19)
+    second_fit = F
+  } else {
+    second_fit = T
+    y_new = coef(fit)["C"]*( 1 - exp( coef(fit)["k"]*t ) )
+    w = 1/y_new
+  }
+  
+  if (second_fit) {
+    # Correct for variance with weights in a second pass fit
+    fit <- tryCatch(nls( y ~ C*( 1 - exp( k*t ) ),
+                         start=c( C=max(y), k=-0.1 ),
+                         weights=w,
+                         lower=c(C=1,k=-5.0), upper=c(C=1e7,k=-0.01),
+                         control=list(warnOnly=T) ), 
+                    error=function(e) NULL )
+    
+    if (is.null(fit)) {
+      output_vec = rep(NA, 19)
+    } else { 
+      k = coef(fit)["k"]
+      C = coef(fit)["C"]
+      
+      res_sum = sum((resid(fit))**2*fit$weights)
+      quality = res_sum/C**2
+      tot_sum = sum((y - mean(y))**2*fit$weights)
+      resids = resid(fit)
+
+      # Estimate confidence intervals based on likelihood profile method      
+      CI_50 <- tryCatch(confint(fit, level = 0.5), 
+                        error=function(e) NULL )
+      CI_70 <- tryCatch(confint(fit, level = 0.7), 
+                        error=function(e) NULL )      
+      if (is.null(CI_50)) {
+        CI_50_lower = NA
+        CI_50_upper = NA
+      } else {
+        CI_50_lower = CI_50[2,1]
+        CI_50_upper = CI_50[2,2]
+      }
+      if (is.null(CI_70)) {
+        CI_70_lower = NA
+        CI_70_upper = NA
+      } else {
+        CI_70_lower = CI_70[2,1]
+        CI_70_upper = CI_70[2,2]
+      }
+
+      # Construct output vector. Correct for missing 1H timepoint in Neu20.
+      if (celltype == "Neu20") {
+        resids = c(resids[1], NA, resids[2:4])
+        y = c(y[1], NA, y[2:4])
+        output_vec = c(-log(2)/k, C, quality, res_sum, tot_sum, resids, CI_50_lower, CI_50_upper, CI_70_lower, CI_70_upper, y)
+      } else {
+        output_vec = c(-log(2)/k, C, quality, res_sum, tot_sum, resids, CI_50_lower, CI_50_upper, CI_70_lower, CI_70_upper, y)
+      }
+    }
+    
+  }
+  
+  if (ind %% 100 == 0) {
+    print(ind)
+  }
+  
+  # Give proper names to output
+  names(output_vec) = c("HL", "C", "quality", "rsqsum", "totsqsum", 
+                        "res_30m", "res_1H", "res_4H", "res_8H", "res_24H",
+                        "CI_50_low", "CI_50_high", "CI_70_low", "CI_70_high",
+                        "count_30m", "count_1H", "count_4H", "count_8H", "count_24H")
+  return(output_vec)
+}
+```
+
+Fit the data to estimate half-life
+```{r}
+# Fit data for the first 100 genes of WT neurons
+# Two main outputs are the first 2 columns of result_tbl
+# The rest columns are auxiliary
+res = sapply(X = 1:100, FUN = estimate_HL, 
+             normed_avg_tbl %>% select(-contains("SS")), "Neu_WT")
+result_tbl = data.frame(t(res))
+```
+
+
+
+#########
+
+
+

@@ -1,0 +1,158 @@
+---
+title: "K-mers analysis of 3'UTRs for buffered genes"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Code below was used to run the transite analysis. No data is provided for this part on the github. We just highlight the logic.
+```{r}
+library(transite)
+library(dplyr)
+library(Biostrings)
+
+TR_gene_tbl = read.csv("~/transite_analysis/TR_genes.csv",
+                       header = T) %>%
+              # Define thresholds for significant fold changes
+              mutate(TR_DEA_status = NA,
+                     TR_DEA_status = ifelse(abs(log2FC_Neu_RTT_WT) < 0.5 | padj_Neu_RTT_WT > 0.1,
+                                            "Not", TR_DEA_status),
+                     TR_DEA_status = ifelse(log2FC_Neu_RTT_WT > 0.5 & padj_Neu_RTT_WT < 0.1,
+                                            "Up", TR_DEA_status),
+                     TR_DEA_status = ifelse(log2FC_Neu_RTT_WT < -0.5 & padj_Neu_RTT_WT < 0.1,
+                                            "Down", TR_DEA_status)) %>% 
+              select(gene, TR_DEA_status) %>%
+              filter(TR_DEA_status != "Not")
+
+SS_TR_tbl = read.csv("~/transite_analysis/SS_TR_isoforms.csv",
+                      header = T) %>%
+            mutate(ID = gene) %>%
+            tidyr::separate(gene, c("gene"), "_") %>%
+            select(ID, gene, log2_SS_TR_Neu_WT, log2_SS_TR_Neu_RTT, 
+                   lfcSE_Neu_WT, lfcSE_Neu_RTT) %>%
+            # Half-life fold-change significance is measured by Z-score below
+            mutate(log2_SS_TR_FC = log2_SS_TR_Neu_RTT - log2_SS_TR_Neu_WT,
+                   Z_SS_TR_FC = abs(log2_SS_TR_FC)/sqrt(lfcSE_Neu_WT**2 + lfcSE_Neu_RTT**2)) %>%
+            # Define large enough half-life change
+            mutate(HL_DEA_status = NA,
+                   HL_DEA_status = ifelse(log2_SS_TR_FC > 1 & 
+                                          Z_SS_TR_FC > quantile(Z_SS_TR_FC, 0.5, na.rm = T),
+                                          "Up", HL_DEA_status),
+                   HL_DEA_status = ifelse(log2_SS_TR_FC < -1 & 
+                                          Z_SS_TR_FC > quantile(Z_SS_TR_FC, 0.5, na.rm = T),
+                                          "Down", HL_DEA_status),
+                   HL_DEA_status = ifelse(abs(log2_SS_TR_FC) < 0.5,
+                                          "Not", HL_DEA_status))
+
+TR_iso_tbl = read.csv("~/transite_analysis/TR_isoforms.csv",
+                   header = T) %>%
+             tidyr::separate(gene, c("X", "site_type"), ";") %>%
+             filter(grepl("3UTR", site_type)) %>%
+             tidyr::separate(X, c("gene", "chr", "strand", "start", "end"), "_") %>%
+             # ID of a 3'UTR isoform
+             mutate(ID = paste(gene, strand, start, sep = "_")) %>%
+             select(ID, gene, TR_Neu_WT, TR_Neu_RTT, log2FC_Neu_RTT_WT, padj_Neu_RTT_WT)
+
+ID_between_cells = (TR_iso_tbl %>% 
+                      mutate(TR_avg = log(TR_Neu_WT * TR_Neu_RTT, 2)) %>%
+                      # Pick the most abundant 3'UTR isoform of a gene
+                      group_by(gene) %>%
+                      filter(TR_avg == max(TR_avg)) %>%
+                      mutate(isoform_index = 1:n()) %>%
+                      filter(isoform_index == 1))$ID
+
+UTR_response = SS_TR_tbl %>%
+               left_join(TR_gene_tbl) %>%
+                filter(ID %in% ID_between_cells) %>%
+                select(ID, HL_DEA_status, TR_DEA_status) %>%
+                na.omit() %>%
+                mutate(group = ifelse(TR_DEA_status == "Down" & HL_DEA_status == "Up", 
+                                      "A", NA),
+                       group = ifelse(TR_DEA_status == "Down" & HL_DEA_status != "Up", 
+                                      "B", group),
+                       group = ifelse(TR_DEA_status == "Up" & HL_DEA_status == "Down", 
+                                      "B", group),
+                       group = ifelse(TR_DEA_status == "Up" & HL_DEA_status != "Down", 
+                                      "A", group))
+
+# DNA sequence for the 3'UTRs in a fasta format
+UTR_dna = readDNAStringSet('~/transite_analysis/UTR_dna.fa')
+UTR_dna_abund_filter = data.frame(length = width(UTR_dna),
+                                  ID = names(UTR_dna)) %>%
+                       tidyr::separate(ID, c("gene", "strand", "start"), "_", remove = F) %>%
+                       # Keep most abundant isoforms selected before
+                       # longer than 6 nucleotides
+                       filter(ID %in% ID_between_cells,
+                               length > 6)
+UTR_dna_abund = UTR_dna[names(UTR_dna) %in% UTR_dna_abund_filter$ID, ]
+
+utr_seq = data.frame(ID = names(UTR_dna_abund),
+                     seq = as.character(UTR_dna_abund))
+
+print("prepared first set of sequences")
+foreground_set = (utr_seq %>%
+                    filter(ID %in% (UTR_response %>% 
+                                      filter(TR_DEA_status == "Up" & group == "B"))$ID))$seq
+background_set = (utr_seq %>%
+                    filter(ID %in% (UTR_response %>% 
+                                      filter(TR_DEA_status == "Up"))$ID))$seq
+
+# Convert to RNA sequence
+foreground_set = gsub("T", "U", foreground_set)
+background_set = gsub("T", "U", background_set)
+
+# run k-mer based TSMA with all Transite motifs (recommended):
+print("started TR UP analysis")
+results_UP <- run_kmer_tsma(list(foreground_set), background_set,
+                            n_cores = 32)
+
+print("prepared second set of sequences")
+foreground_set = (utr_seq %>%
+                    filter(ID %in% (UTR_response %>% 
+                                      filter(TR_DEA_status == "Down" & group == "A"))$ID))$seq
+background_set = (utr_seq %>%
+                    filter(ID %in% (UTR_response %>% 
+                                      filter(TR_DEA_status == "Down"))$ID))$seq
+
+# Convert to RNA sequence
+foreground_set = gsub("T", "U", foreground_set)
+background_set = gsub("T", "U", background_set)
+
+# run k-mer based TSMA with all Transite motifs (recommended):
+print("started TR DOWN analysis")
+results_DOWN <- run_kmer_tsma(list(foreground_set), background_set,
+                              n_cores = 32)
+
+print("saving results data")
+
+saveRDS(object = results_UP[[1]][["enrichment_df"]],
+        file = "~/transite_analysis/RBP/TR_UP_fg_enrichment_df.rds")
+saveRDS(object = results_UP[[1]][["motif_kmers_dfs"]],
+        file = "~/transite_analysis/RBP/TR_UP_fg_motif_kmers_dfs.rds")
+saveRDS(object = results_UP[[1]][["motif_df"]],
+        file = "~/transite_analysis/RBP/TR_UP_fg_motif_df.rds")
+saveRDS(object = results_DOWN[[1]][["enrichment_df"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_fg_enrichment_df.rds")
+saveRDS(object = results_DOWN[[1]][["motif_kmers_dfs"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_fg_motif_kmers_dfs.rds")
+saveRDS(object = results_DOWN[[1]][["motif_df"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_fg_motif_df.rds")
+
+
+saveRDS(object = results_UP[[2]][["enrichment_df"]],
+        file = "~/transite_analysis/RBP/TR_UP_bg_enrichment_df.rds")
+saveRDS(object = results_UP[[2]][["motif_kmers_dfs"]],
+        file = "~/transite_analysis/RBP/TR_UP_bg_motif_kmers_dfs.rds")
+saveRDS(object = results_UP[[2]][["motif_df"]],
+        file = "~/transite_analysis/RBP/TR_UP_bg_motif_df.rds")
+saveRDS(object = results_DOWN[[2]][["enrichment_df"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_bg_enrichment_df.rds")
+saveRDS(object = results_DOWN[[2]][["motif_kmers_dfs"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_bg_motif_kmers_dfs.rds")
+saveRDS(object = results_DOWN[[2]][["motif_df"]],
+        file = "~/transite_analysis/RBP/TR_DOWN_bg_motif_df.rds")
+```

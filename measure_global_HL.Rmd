@@ -1,0 +1,63 @@
+---
+title: "Global average half-life per cell type"
+output:
+  html_notebook:
+    toc: true
+    number_sections: true
+    theme: readable
+author: Marat Mufteev
+date: "`r format(Sys.time(), 'Generated on %d %B, %Y')`"
+---
+
+Upload libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+```
+
+Upload half-life (HL) data from a saturation curve fit
+```{r}
+HL_tbl = read.csv("./HL_saturation_curve.csv.gz",
+                  header = T)
+```
+
+To measure average half-life (HL) we attempted multiple methods.
+Genes included for the calculation:
+A) all genes with measured HL
+B) unreliable genes are removed (degree of stringency could be varied)
+C) HL values for unreliable genes are interpolated from a ratio method
+We noticed that the conclusion on a global HL shift didn't depend on the method.
+```{r}
+# Method B 
+# Thresholds are somewhat arbitrary
+# However, the higher average HL in RTT neurons is not too sensitive to the thresholds in a reasonable range
+HL_clean = HL_tbl %>%
+           group_by(celltype) %>%
+           filter(TR > quantile(TR, 0.1, na.rm = T) | 
+                  SS > quantile(SS, 0.1, na.rm = T),
+                  CI50_HL < 0.75) %>%
+           ungroup() %>%
+           select(gene, celltype, HL)
+```
+
+Visualize a global shift in HL
+```{r}
+ggplot(data = HL_clean,
+       aes(x = log(HL, 10),
+           color = celltype)) +
+  stat_density(geom = "line", position = "identity", size = 1) +
+  scale_color_manual(values = c("#FFAA00", "#0092FF")) +
+  ggthemes::theme_base(base_size = 25) +
+  scale_x_continuous(breaks = c(0, 0.4771213, log(9, 10)), labels = c(1, 3, 9), 
+                     limits = c(log(0.5, 10), log(24, 10))) +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank()) +
+  theme(plot.background = element_rect(fill = "white",colour = "white",size = 1))
+```
+
+
+
+
+
+
