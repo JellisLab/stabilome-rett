@@ -22,7 +22,7 @@ The *data* folder contains auxiliary sequence data, quantified genes based on pA
    Normalize endogenous microRNA abundances with spike-in RNA.
 6. **construct_primir_annotation.Rmd**
 
-   Prepare pA sites annotations of primary microRNAs based on transcripts annotation from [PMID: 26290535] (https://genome.cshlp.org/content/25/9/1401)
+   Prepare pA sites annotations of primary microRNAs based on transcripts annotation from [PMID: 26290535](https://genome.cshlp.org/content/25/9/1401)
 7. **transite_analysis.Rmd**
 
    Identify sequence features of buffered mRNAs relative to mRNAs with a same direction of transcription rate shift.
